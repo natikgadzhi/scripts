@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-BASE_DIR="$HOME/src/natikgadzhi"
+BASE_DIR="${1:-$HOME/src/natikgadzhi}"
 
-# Collect all git repos first
+# Collect all git repos recursively
 declare -a repos=()
 declare -a dirs=()
-for dir in "$BASE_DIR"/*/; do
-    [ -d "$dir/.git" ] || continue
-    repos+=("$(basename "$dir")")
+while IFS= read -r gitdir; do
+    dir="$(dirname "$gitdir")"
+    # Show path relative to BASE_DIR for readability
+    repos+=("${dir#$BASE_DIR/}")
     dirs+=("$dir")
-done
+done < <(find "$BASE_DIR" -name .git -type d 2>/dev/null | sort)
 
 total=${#repos[@]}
 if [ "$total" -eq 0 ]; then
