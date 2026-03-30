@@ -11,7 +11,7 @@ while IFS= read -r gitdir; do
     # Show path relative to BASE_DIR for readability
     repos+=("${dir#$BASE_DIR/}")
     dirs+=("$dir")
-done < <(find "$BASE_DIR" -name .git -type d 2>/dev/null | sort)
+done < <(find "$BASE_DIR" -name .git -type d 2>/dev/null | grep -v '\.build' | sort)
 
 total=${#repos[@]}
 if [ "$total" -eq 0 ]; then
