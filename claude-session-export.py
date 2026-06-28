@@ -281,6 +281,10 @@ def write_note(meta: dict[str, Any], entries: list[dict[str, Any]]) -> Path:
     # synced_at, content_hash, sync_source during vault sync.
     fm = render_frontmatter({
         "session_id": meta["session_id"],
+        # Provenance: this note's Summary is model-written. A skill that later reads it
+        # should treat it as a claim and re-verify before citing as fact.
+        "source": "claude-session-export",
+        "generated_by": "claude",
         "transcript": meta["transcript_path"],
         "project": meta["project_name"],
         "project_path": meta["project_path"],
