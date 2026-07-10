@@ -1,36 +1,66 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["anthropic"]
 # ///
 """
 claude-session-export: Extract Claude Code session metadata into markdown.
 
 Runs as a SessionEnd hook. Parses the session transcript JSONL, extracts
-structured metadata, writes a markdown note to a staging directory
-(~/.local/share/claude-sessions/), then calls the Anthropic API to generate
-a summary and edits it into the note. obsidian-tools then syncs from the
-staging directory into the Obsidian vault.
+structured metadata, writes a note (frontmatter + summary + user prompts)
+plus a full untruncated transcript companion file directly into the
+Obsidian vault, under a subdir named for the account the session belongs to
+(work/personal) so sessions from either account never mix. The account is
+inferred from the project path (see infer_account) — no manual toggle to
+remember. CLAUDE_ACCOUNT env var overrides it for the rare project that
+doesn't fit the heuristic.
 
 Can also be invoked manually:
     claude-session-export /path/to/transcript.jsonl [--project-path /path]
 """
 
 import json
+import os
+import subprocess
 import sys
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import anthropic
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-OUTPUT_DIR = Path.home() / ".local" / "share" / "claude-sessions"
+# Override with CLAUDE_SESSIONS_VAULT_DIR if the vault lives elsewhere on a
+# given machine.
+VAULT_DIR = Path(
+    os.environ.get(
+        "CLAUDE_SESSIONS_VAULT_DIR",
+        str(Path.home() / "Documents" / "Obsidian" / "Personal" / "Claude Sessions"),
+    )
+)
 MAX_TRANSCRIPT_CHARS = 100_000
 MIN_MESSAGES = 2
+# Path substrings that mean "this is a work (Lambda) project" — see
+# lambdal/skills CLAUDE.md, which documents ~/src/lambdal/ and ~/code/lambdal/
+# as where Core Cloud repos live.
+WORK_PATH_MARKERS = ("/lambdal/", "/lambdal")
+
+
+def infer_account(cwd: str) -> str:
+    """Which Claude account a session belongs to: work or personal.
+
+    Inferred from the project path rather than tracked manually — Claude Code
+    gives hooks no direct signal for which logged-in account produced a
+    session, but in practice work sessions always run inside a Lambda repo.
+    CLAUDE_ACCOUNT env var overrides this for the rare project that doesn't fit.
+    """
+    env_account = os.environ.get("CLAUDE_ACCOUNT")
+    if env_account:
+        return env_account.strip()
+    normalized = (cwd or "").lower()
+    if any(marker in normalized for marker in WORK_PATH_MARKERS):
+        return "work"
+    return "personal"
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +101,7 @@ def extract_metadata(
     session_id: str,
     cwd: str,
     transcript_path: str,
+    account: str,
 ) -> dict[str, Any]:
     """Pull structured metadata out of transcript entries."""
     tools_used: set[str] = set()
@@ -113,6 +144,7 @@ def extract_metadata(
 
     return {
         "session_id": session_id,
+        "account": account,
         "project_name": project_name,
         "project_path": cwd,
         "transcript_path": transcript_path,
@@ -178,10 +210,10 @@ def _collect_assistant(
 
 
 # ---------------------------------------------------------------------------
-# Condensed transcript for agent hook
+# Human-readable transcript rendering
 # ---------------------------------------------------------------------------
-def build_condensed_transcript(entries: list[dict[str, Any]]) -> str:
-    """Build a human-readable transcript for summarization."""
+def build_transcript(entries: list[dict[str, Any]], max_chars: int | None) -> str:
+    """Render a human-readable transcript, truncated to max_chars if given."""
     parts: list[str] = []
     for entry in entries:
         etype = entry.get("type")
@@ -201,14 +233,24 @@ def build_condensed_transcript(entries: list[dict[str, Any]]) -> str:
                 parts.append(f"**Assistant**: {' | '.join(pieces)}")
 
     transcript = "\n\n".join(parts)
-    if len(transcript) > MAX_TRANSCRIPT_CHARS:
-        half = MAX_TRANSCRIPT_CHARS // 2
+    if max_chars is not None and len(transcript) > max_chars:
+        half = max_chars // 2
         transcript = (
             transcript[:half]
             + "\n\n[... transcript truncated ...]\n\n"
             + transcript[-half:]
         )
     return transcript
+
+
+def build_condensed_transcript(entries: list[dict[str, Any]]) -> str:
+    """Condensed transcript used as the summarization prompt (cost-bounded)."""
+    return build_transcript(entries, MAX_TRANSCRIPT_CHARS)
+
+
+def build_full_transcript(entries: list[dict[str, Any]]) -> str:
+    """Full, untruncated transcript archived alongside the summary note."""
+    return build_transcript(entries, None)
 
 
 def _text_blocks(entry: dict) -> list[str]:
@@ -269,23 +311,49 @@ def render_frontmatter(fields: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def write_note(meta: dict[str, Any], entries: list[dict[str, Any]]) -> Path:
-    """Write the Obsidian note (without summary) and return its path."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def write_transcript(meta: dict[str, Any], entries: list[dict[str, Any]], stem: str, account_dir: Path) -> Path:
+    """Write the full, untruncated transcript companion file and return its path."""
+    transcripts_dir = account_dir / "transcripts"
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    transcript_filepath = transcripts_dir / f"{stem}.md"
 
-    short_id = meta["session_id"][:8]
-    filename = f"{meta['date']}-{meta['project_name']}-{short_id}.md"
-    filepath = OUTPUT_DIR / filename
-
-    # Session-specific frontmatter only. obsidian-tools adds synced_from,
-    # synced_at, content_hash, sync_source during vault sync.
     fm = render_frontmatter({
         "session_id": meta["session_id"],
+        "account": meta["account"],
+        "source": "claude-session-export",
+        "note": f"../{stem}.md",
+        "project": meta["project_name"],
+        "date": meta["date"],
+    })
+    body = build_full_transcript(entries)
+    transcript_filepath.write_text(f"{fm}\n\n{body}\n")
+    return transcript_filepath
+
+
+def write_note(meta: dict[str, Any], entries: list[dict[str, Any]]) -> Path:
+    """Write the Obsidian note (without summary) and return its path."""
+    account_dir = VAULT_DIR / meta["account"]
+    account_dir.mkdir(parents=True, exist_ok=True)
+
+    short_id = meta["session_id"][:8]
+    stem = f"{meta['date']}-{meta['project_name']}-{short_id}"
+    filename = f"{stem}.md"
+    filepath = account_dir / filename
+
+    transcript_filepath = write_transcript(meta, entries, stem, account_dir)
+    transcript_relpath = f"transcripts/{stem}.md"
+
+    fm = render_frontmatter({
+        "session_id": meta["session_id"],
+        "account": meta["account"],
         # Provenance: this note's Summary is model-written. A skill that later reads it
         # should treat it as a claim and re-verify before citing as fact.
         "source": "claude-session-export",
         "generated_by": "claude",
-        "transcript": meta["transcript_path"],
+        # Raw JSONL is machine-local and won't resolve on other laptops — the
+        # full transcript below is the portable copy that travels with the vault.
+        "transcript_path": meta["transcript_path"],
+        "full_transcript": transcript_relpath,
         "project": meta["project_name"],
         "project_path": meta["project_path"],
         "date": meta["date"],
@@ -326,8 +394,11 @@ def write_note(meta: dict[str, Any], entries: list[dict[str, Any]]) -> Path:
             display = display.replace("\n", "\n  ")
             body_parts.append(f"{i}. {display}")
 
+    body_parts.append(f"## Full Transcript\n\n[Full transcript]({transcript_relpath})")
+
     body = "\n\n".join(body_parts)
     filepath.write_text(f"{fm}\n\n{body}\n")
+    print(f"Transcript archived → {transcript_filepath}", file=sys.stderr)
     return filepath
 
 
@@ -345,7 +416,9 @@ Generate a structured summary with these sections (omit any that have nothing no
 - **Learnings**: Non-obvious insights, patterns, techniques discovered
 - **Skills & Tools Assessment**: How tools/skills performed — issues, limitations, effective combinations
 
-Use bullet points. Be concise — this is a reference document, not a narrative. No preamble.
+Use bullet points. Be concise — this is a reference document, not a narrative. No preamble,
+and no top-level heading (e.g. no "# Summary") — start directly with the first bullet section,
+since this gets inserted under a "## Summary" heading that already exists.
 
 ---
 
@@ -354,14 +427,25 @@ Use bullet points. Be concise — this is a reference document, not a narrative.
 
 
 def generate_summary(transcript: str, note_path: Path) -> None:
-    """Call the Anthropic API to generate a summary and edit it into the note."""
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": SUMMARY_PROMPT.format(transcript=transcript)}],
+    """Shell out to `claude -p` to generate a summary and edit it into the note.
+
+    Uses the Claude Code CLI itself (the user's existing subscription/auth) rather
+    than a raw Anthropic API key, so this has no separate credential to manage.
+    --safe-mode disables hooks and --no-session-persistence skips writing a
+    transcript for this call — both needed to stop it from recursively
+    triggering (and being picked up by) this very SessionEnd hook.
+    """
+    result = subprocess.run(
+        [
+            "claude", "-p", "--safe-mode", "--no-session-persistence",
+            "--model", "claude-haiku-4-5-20251001",
+        ],
+        input=SUMMARY_PROMPT.format(transcript=transcript),
+        capture_output=True, text=True, timeout=120,
     )
-    summary = message.content[0].text.strip()
+    if result.returncode != 0:
+        raise RuntimeError(f"claude -p failed: {result.stderr.strip()}")
+    summary = result.stdout.strip()
 
     note_text = note_path.read_text()
     note_text = note_text.replace(
@@ -416,7 +500,7 @@ def main() -> None:
         sys.exit(0)
 
     # Extract metadata
-    meta = extract_metadata(entries, session_id, cwd, transcript_path)
+    meta = extract_metadata(entries, session_id, cwd, transcript_path, infer_account(cwd))
 
     # Skip very short sessions
     if meta["message_count"] < MIN_MESSAGES:
